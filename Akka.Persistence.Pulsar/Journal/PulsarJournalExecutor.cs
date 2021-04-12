@@ -8,13 +8,10 @@ using Akka.Actor;
 using Akka.Event;
 using Akka.Persistence.Pulsar.Query;
 using Akka.Serialization;
-using SharpPulsar.Akka;
-using SharpPulsar.Akka.Configuration;
-using SharpPulsar.Akka.InternalCommands.Consumer;
-using SharpPulsar.Akka.InternalCommands.Producer;
-using SharpPulsar.Api;
-using SharpPulsar.Handlers;
-using SharpPulsar.Impl.Schema;
+using SharpPulsar;
+using SharpPulsar.Configuration;
+using SharpPulsar.Interfaces;
+using SharpPulsar.Schemas;
 
 namespace Akka.Persistence.Pulsar.Journal
 {
@@ -26,7 +23,7 @@ namespace Akka.Persistence.Pulsar.Journal
         public static readonly ConcurrentDictionary<string, IActorRef> Producers = new ConcurrentDictionary<string, IActorRef>();
         private readonly DefaultProducerListener _producerListener;
 
-        private readonly AvroSchema _journalEntrySchema;
+        private readonly AvroSchema<JournalEntry> _journalEntrySchema;
         private readonly List<string> _activeReplayTopics;
 
         public PulsarJournalExecutor(ActorSystem actorSystem, PulsarSettings settings, ILoggingAdapter log, Serializer serializer, CancellationTokenSource cancellation)
@@ -35,8 +32,8 @@ namespace Akka.Persistence.Pulsar.Journal
             Settings = settings;
             _log = log;
             _serializer = serializer; 
-            _journalEntrySchema = AvroSchema.Of(typeof(JournalEntry), new Dictionary<string, string>());
-            AvroSchema.Of(typeof(PersistentIdEntry));
+            _journalEntrySchema = AvroSchema<JournalEntry>.Of(typeof(JournalEntry), new Dictionary<string, string>());
+            //AvroSchema.Of(typeof(PersistentIdEntry));
             _producerListener = new DefaultProducerListener(o =>
             {
                 _log.Info(o.ToString());
@@ -69,14 +66,14 @@ namespace Akka.Persistence.Pulsar.Journal
             {
                 var consumerListener = new DefaultConsumerEventListener(Console.WriteLine);
                 var readerListener = new DefaultMessageListener(null, null);
-                var jsonSchem = AvroSchema.Of(typeof(JournalEntry));
-                var readerConfig = new ReaderConfigBuilder()
+                var jsonSchem = AvroSchema<JournalEntry>.Of(typeof(JournalEntry));
+                var readerConfig = new ReaderConfigBuilder<JournalEntry>()
                     .ReaderName("event-reader")
                     .Schema(jsonSchem)
                     .EventListener(consumerListener)
                     .ReaderListener(readerListener)
                     .Topic(topic)
-                    .StartMessageId(MessageIdFields.Latest)
+                    .StartMessageId(IMessageId.Latest)
                     .ReaderConfigurationData;
                 var replay = new ReplayTopic(readerConfig, Settings.AdminUrl, fromSequenceNr, toSequenceNr, max, null, false);
                 var messages = Client.EventSource<JournalEntry>(replay);

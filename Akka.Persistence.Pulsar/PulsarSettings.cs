@@ -11,9 +11,9 @@ using System;
 using System.Security.Cryptography.X509Certificates;
 using Akka.Actor;
 using Akka.Configuration;
-using SharpPulsar.Akka;
-using SharpPulsar.Akka.Network;
-using SharpPulsar.Impl.Auth;
+using SharpPulsar;
+using SharpPulsar.Auth;
+using SharpPulsar.Configuration;
 
 namespace Akka.Persistence.Pulsar
 {

@@ -22,12 +22,6 @@ using Akka.Event;
 using Akka.Persistence.Journal;
 using Akka.Persistence.Pulsar.Query;
 using Akka.Serialization;
-using SharpPulsar.Akka.Configuration;
-using SharpPulsar.Akka.InternalCommands;
-using SharpPulsar.Akka.InternalCommands.Consumer;
-using SharpPulsar.Api;
-using SharpPulsar.Handlers;
-using SharpPulsar.Impl.Schema;
 
 namespace Akka.Persistence.Pulsar.Journal
 {
