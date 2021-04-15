@@ -53,12 +53,11 @@ namespace Akka.Persistence.Pulsar.Snapshot
             _snapshotEntrySchema = AvroSchema<SnapshotEntry>.Of(typeof(SnapshotEntry));
             _serializer = Context.System.Serialization.FindSerializerForType(SnapshotType);
             _settings = settings;
-            var topic = TopicName.Get(settings.TopicPrefix);
             _sqlClientOptions = new ClientOptions 
             { 
-                Server = settings.ServiceUrl,
+                Server = settings.PrestoServer,
                 Catalog = "pulsar",
-                Schema = $"{topic.NamespaceObject.Tenant}/{topic.NamespaceObject.LocalName}"
+                Schema = $"{settings.Tenant}/{settings.Namespace}"
             };
             _pulsarSystem = settings.CreateSystem(Context.System);
             _client = _pulsarSystem.NewClient();
@@ -80,8 +79,7 @@ namespace Akka.Persistence.Pulsar.Snapshot
         protected override async Task<SelectedSnapshot> LoadAsync(string persistenceId, SnapshotSelectionCriteria criteria)
         {
             SelectedSnapshot shot = null;
-            var options = new ClientOptions();
-            _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, Timestamp, Snapshot  from snapshot-{persistenceId} WHERE SequenceNr <= {criteria.MaxSequenceNr} AND Timestamp <= {criteria.MaxTimeStamp.ToEpochTime()} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT 1";
+            _sqlClientOptions.Execute = $"select Id, PersistenceId, __sequence_id__ as SequenceNr, Timestamp, Snapshot  from snapshot-{persistenceId} WHERE SequenceNr <= {criteria.MaxSequenceNr} AND Timestamp <= {criteria.MaxTimeStamp.ToEpochTime()} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT 1";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
             var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
             _sqlClientOptions.Execute = string.Empty;
@@ -102,14 +100,14 @@ namespace Akka.Persistence.Pulsar.Snapshot
 
         protected override async Task SaveAsync(SnapshotMetadata metadata, object snapshot)
         {
-            var producer = await GetProducer(metadata.PersistenceId, "Snapshot");
+            var producer = await GetProducer(metadata.PersistenceId);
             var snapshotEntry = ToSnapshotEntry(metadata, snapshot);
             await producer.SendAsync(snapshotEntry);
         }
 
         private async ValueTask CreateSnapshotProducer(string persistenceid)
         {
-            var topic = $"{_settings.TopicPrefix.TrimEnd('/')}/snapshot-{persistenceid}".ToLower();
+            var topic = $"persistent://{_settings.Tenant}/{_settings.Namespace}/snapshot-{persistenceid}".ToLower();
             if (!_producers.ContainsKey(topic))
             {
                 var producerConfig = new ProducerConfigBuilder<SnapshotEntry>()
@@ -121,22 +119,17 @@ namespace Akka.Persistence.Pulsar.Snapshot
                 _producers[producer.Topic] = producer;
             }
         }
-        private async ValueTask<Producer<SnapshotEntry>> GetProducer(string persistenceid, string type)
+        private async ValueTask<Producer<SnapshotEntry>> GetProducer(string persistenceid)
         {
-            var topic = $"{_settings.TopicPrefix.TrimEnd('/')}/{type}-{persistenceid}".ToLower();
-            if(_producers.TryGetValue(topic, out var p))
+            var topic = $"persistent://{_settings.Tenant}/{_settings.Namespace}/snapshot-{persistenceid}".ToLower();
+            if (_producers.TryGetValue(topic, out var p))
             {
                 return p;
             }
             else
             {
-                switch (type.ToLower())
-                {
-                    case "snapshot":
-                        await CreateSnapshotProducer(persistenceid);
-                        break;
-                }
-                return await GetProducer(persistenceid, type);
+                await CreateSnapshotProducer(persistenceid);
+                return _producers[topic];
             }
         }
         protected override void PostStop()

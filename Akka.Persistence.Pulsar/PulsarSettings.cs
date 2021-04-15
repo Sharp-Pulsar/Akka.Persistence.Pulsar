@@ -29,13 +29,11 @@ namespace Akka.Persistence.Pulsar
             ServiceUrl = config.GetString("service-url", "pulsar://localhost:6650");
             VerifyCertificateAuthority = config.GetBoolean("verify-certificate-authority", true);
             VerifyCertificateName = config.GetBoolean("verify-cerfiticate-name", false);
-            UseProxy = config.GetBoolean("use-proxy", false);
             OperationTimeOut = config.GetInt("operation-time-out");
             AuthClass = config.HasPath("auth-class") ? config.GetString("auth-class") : "";
             AuthParam = config.HasPath("auth-param") ? config.GetString("auth-param") : "";
             PrestoServer = config.GetString("presto-server");
             AdminUrl = config.GetString("admin-url");
-            TopicPrefix = config.GetString("topic-prefix");
             Tenant = config.GetString("pulsar-tenant");
             Namespace = config.GetString("pulsar-namespace");
             TrustedCertificateAuthority = config.HasPath("trusted-certificate-authority-file") 
@@ -51,11 +49,9 @@ namespace Akka.Persistence.Pulsar
         public string Tenant { get; set; }
         public string Namespace { get; set; }
         public string PrestoServer { get; set; }
-        public string TopicPrefix { get; set; }// prefix in this sense persistent://public/default/{this part added at runtime}
         public string AuthClass { get; set; }
         public string AuthParam { get; set; }
         public int OperationTimeOut { get; set; }
-        public bool UseProxy { get; set; }
         public string AdminUrl { get; set; }
         public bool VerifyCertificateAuthority { get; set; }
         public bool VerifyCertificateName { get; set; }
@@ -71,7 +67,6 @@ namespace Akka.Persistence.Pulsar
                 .VerifyCertAuth(VerifyCertificateAuthority)
                 .VerifyCertName(VerifyCertificateName)
                 .ConnectionsPerBroker(1)
-                .UseProxy(UseProxy)
                 .OperationTimeout(OperationTimeOut)
                 .Authentication(AuthenticationFactory.Create(AuthClass, AuthParam));
 

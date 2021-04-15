@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Akka.Actor;
@@ -10,18 +11,25 @@ using Akka.Persistence.Pulsar.Query;
 using Akka.Serialization;
 using SharpPulsar;
 using SharpPulsar.Configuration;
-using SharpPulsar.Interfaces;
+using SharpPulsar.Messages;
 using SharpPulsar.Schemas;
+using SharpPulsar.Sql;
+using SharpPulsar.Sql.Client;
+using SharpPulsar.Sql.Message;
+using SharpPulsar.User;
 
 namespace Akka.Persistence.Pulsar.Journal
 {
     public sealed class PulsarJournalExecutor
     {
+        private readonly PulsarSystem _pulsarSystem;
+        private readonly PulsarClient _client;
+        private readonly Sql<SqlData> _sql;
+        private readonly ClientOptions _sqlClientOptions;
         private readonly ILoggingAdapter _log ;
         private readonly Serializer _serializer;
         private static readonly Type PersistentRepresentationType = typeof(IPersistentRepresentation);
         public static readonly ConcurrentDictionary<string, IActorRef> Producers = new ConcurrentDictionary<string, IActorRef>();
-        private readonly DefaultProducerListener _producerListener;
 
         private readonly AvroSchema<JournalEntry> _journalEntrySchema;
         private readonly List<string> _activeReplayTopics;
@@ -33,69 +41,70 @@ namespace Akka.Persistence.Pulsar.Journal
             _log = log;
             _serializer = serializer; 
             _journalEntrySchema = AvroSchema<JournalEntry>.Of(typeof(JournalEntry), new Dictionary<string, string>());
-            //AvroSchema.Of(typeof(PersistentIdEntry));
-            _producerListener = new DefaultProducerListener(o =>
+            _sqlClientOptions = new ClientOptions
             {
-                _log.Info(o.ToString());
-            }, s =>
-            {
-                _log.Info(s);
-            });
-            Settings = settings;
-            Client = settings.CreateSystem(actorSystem);
-            //CreatePersistentProducer();
-            //GetAllPersistenceIds();
+                Server = settings.ServiceUrl,
+                Catalog = "pulsar",
+                Schema = $"{settings.Tenant}/{settings.Namespace}"
+            };
+            _pulsarSystem = settings.CreateSystem(actorSystem);
+            _client = _pulsarSystem.NewClient();
+            _sql = PulsarSystem.NewSql();
         }
-        public async Task ReplayMessages(IActorContext context, string persistenceId, long fromSequenceNr, long toSequenceNr, long max, Action<IPersistentRepresentation> recoveryCallback)
+        public async ValueTask ReplayMessages(string persistenceId, long fromSequenceNr, long toSequenceNr, long max, Action<IPersistentRepresentation> recoveryCallback)
         {
             //RETENTION POLICY MUST BE SENT AT THE NAMESPACE ELSE TOPIC IS DELETED
-            var topic = $"{Settings.TopicPrefix.TrimEnd('/')}/journal-{persistenceId}".ToLower();
-            if (_activeReplayTopics.Contains(topic))
+            var topic = $"journal-{persistenceId}".ToLower();
+            _sqlClientOptions.Execute = $"select Id, PersistenceId, __sequence_id__ as SequenceNr, IsDeleted, Payload, Ordering, Tags from {topic} WHERE SequenceNr BETWEEN {fromSequenceNr} AND {toSequenceNr} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT {max}";
+            _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
+
+            _sqlClientOptions.Execute = string.Empty;
+            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
             {
-                var nextPlay = new NextPlay(topic, max, fromSequenceNr, toSequenceNr);
-                var messages = Client.EventSource<JournalEntry>(nextPlay);
-                foreach (var m in messages)
+                switch (data.Response)
                 {
-                    var repy = recoveryCallback;
-                    var payload = m.Payload;
-                    var der = Deserialize(payload);
-                    repy(der);
+                    case DataResponse dr:
+                        var journal = JsonSerializer.Deserialize<JournalEntry>(JsonSerializer.Serialize(dr.Data));                       
+                        var payload = journal.Payload;
+                        var der = Deserialize(payload);
+                        recoveryCallback(der);
+                        break;
+                    case StatsResponse sr:
+                        if(_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                        break;
+                    case ErrorResponse er:
+                        _log.Error(er.Error.FailureInfo.Message);
+                        break;
+                    default:
+                        break; 
                 }
             }
-            else
-            {
-                var consumerListener = new DefaultConsumerEventListener(Console.WriteLine);
-                var readerListener = new DefaultMessageListener(null, null);
-                var jsonSchem = AvroSchema<JournalEntry>.Of(typeof(JournalEntry));
-                var readerConfig = new ReaderConfigBuilder<JournalEntry>()
-                    .ReaderName("event-reader")
-                    .Schema(jsonSchem)
-                    .EventListener(consumerListener)
-                    .ReaderListener(readerListener)
-                    .Topic(topic)
-                    .StartMessageId(IMessageId.Latest)
-                    .ReaderConfigurationData;
-                var replay = new ReplayTopic(readerConfig, Settings.AdminUrl, fromSequenceNr, toSequenceNr, max, null, false);
-                var messages = Client.EventSource<JournalEntry>(replay);
-                foreach (var m in messages)
-                {
-                    var repy = recoveryCallback;
-                    var payload = m.Payload;
-                    var der = Deserialize(payload);
-                    repy(der);
-                }
-                _activeReplayTopics.Add(topic);
-            }
-            
-            await Task.CompletedTask;
         }
-        public async Task<long> ReadHighestSequenceNr(string persistenceId, long fromSequenceNr)
+        public async ValueTask<long> ReadHighestSequenceNr(string persistenceId, long fromSequenceNr)
         {
             try
             {
-                var topic = $"{Settings.TopicPrefix.TrimEnd('/')}/journal-{persistenceId}";
-                var numb = Client.EventSource(new GetNumberOfEntries(topic, Settings.AdminUrl));
-                return await Task.FromResult(numb.Max.Value);
+                var topic = $"journal-{persistenceId}";
+                _sqlClientOptions.Execute = $"select __sequence_id__ as Id from {topic}  ORDER BY __sequence_id__ as DESC LIMIT 1";
+                _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
+                var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
+                _sqlClientOptions.Execute = string.Empty;
+                var data = response.Response;
+                switch (data)
+                {
+                    case DataResponse dr:
+                        return (long)dr.Data["Id"];
+                    case StatsResponse sr:
+                        if(_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                        return 0;
+                    case ErrorResponse er:
+                        _log.Error(er.Error.FailureInfo.Message);
+                        return -1;
+                    default:
+                        return 0;
+                }
             }
             catch (Exception e)
             {
@@ -107,13 +116,11 @@ namespace Akka.Persistence.Pulsar.Journal
             var p = Producers.FirstOrDefault(x => x.Key == topic).Value;
             if (p == null)
             {
-                var producerConfig = new ProducerConfigBuilder()
+                var producerConfig = new ProducerConfigBuilder<JournalEntry>()
                     .ProducerName($"journal-{persistenceid}")
                     .Topic(topic)
                     .Schema(_journalEntrySchema)
-                    .SendTimeout(10000)
-                    .EventListener(_producerListener)
-                    .ProducerConfigurationData;
+                    .SendTimeout(10000);
                 var producer = Client.PulsarProducer(new CreateProducer(_journalEntrySchema, producerConfig));
                 if (Producers.ContainsKey(producer.Topic))
                     Producers[producer.Topic] = producer.Producer;
@@ -147,6 +154,10 @@ namespace Akka.Persistence.Pulsar.Journal
             var topic = $"{Settings.TopicPrefix.TrimEnd('/')}/journal-*";
             var numb = Client.EventSource(new GetNumberOfEntries(topic, Settings.AdminUrl));
             return numb.Max.Value;
+        }
+        private string SubQuery(string persistenceId)
+        {
+
         }
     }
 }

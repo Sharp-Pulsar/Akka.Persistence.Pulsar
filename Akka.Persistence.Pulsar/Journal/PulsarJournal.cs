@@ -79,7 +79,7 @@ namespace Akka.Persistence.Pulsar.Journal
         {
             
             NotifyNewPersistenceIdAdded(persistenceId);
-            await _journalExecutor.ReplayMessages(context, persistenceId, fromSequenceNr, toSequenceNr, max,
+            await _journalExecutor.ReplayMessages(persistenceId, fromSequenceNr, toSequenceNr, max,
                 recoveryCallback);
         }
 
