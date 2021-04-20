@@ -134,14 +134,6 @@ namespace Akka.Persistence.Pulsar.Journal
                     }
                 }
                 var sequenceId = message.HighestSequenceNr > 0 ? message.HighestSequenceNr : 1;
-                var metadata = new Dictionary<string, object>
-                {
-                    ["sequenceId"] = sequenceId,
-                    ["Properties"] = new Dictionary<string, string>
-                    {
-                        {"Tag", string.Join(",", allTags) }
-                    }
-                };
                 var properties = new Dictionary<string, string>();
                 foreach(var tag in allTags)
                 {
@@ -153,7 +145,7 @@ namespace Akka.Persistence.Pulsar.Journal
                 {
                     var journalEntry = ToJournalEntry(m);
                     await producer.NewMessage()
-                        .Property("Tag", string.Join(",", allTags))
+                        .Properties(properties)
                         .SequenceId(sequenceId)
                         .Value(journalEntry)
                         .SendAsync();
