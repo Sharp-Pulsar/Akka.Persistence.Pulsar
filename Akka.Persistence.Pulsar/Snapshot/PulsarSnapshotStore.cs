@@ -15,7 +15,6 @@ using SharpPulsar.User;
 using SharpPulsar.Sql;
 using SharpPulsar.Messages;
 using SharpPulsar.Sql.Client;
-using SharpPulsar.Common.Naming;
 using SharpPulsar.Sql.Message;
 
 namespace Akka.Persistence.Pulsar.Snapshot
@@ -79,7 +78,7 @@ namespace Akka.Persistence.Pulsar.Snapshot
         protected override async Task<SelectedSnapshot> LoadAsync(string persistenceId, SnapshotSelectionCriteria criteria)
         {
             SelectedSnapshot shot = null;
-            _sqlClientOptions.Execute = $"select Id, PersistenceId, __sequence_id__ as SequenceNr, Timestamp, Snapshot  from snapshot-{persistenceId} WHERE SequenceNr <= {criteria.MaxSequenceNr} AND Timestamp <= {criteria.MaxTimeStamp.ToEpochTime()} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT 1";
+            _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, Timestamp, Snapshot from snapshot WHERE PersistenceId = {persistenceId} AND SequenceNr <= {criteria.MaxSequenceNr} AND Timestamp <= {criteria.MaxTimeStamp.ToEpochTime()} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT 1";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
             var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
             _sqlClientOptions.Execute = string.Empty;
@@ -105,31 +104,27 @@ namespace Akka.Persistence.Pulsar.Snapshot
             await producer.SendAsync(snapshotEntry);
         }
 
-        private async ValueTask CreateSnapshotProducer(string persistenceid)
+        private async ValueTask<Producer<SnapshotEntry>> CreateSnapshotProducer(string topic, string persistenceid)
         {
-            var topic = $"persistent://{_settings.Tenant}/{_settings.Namespace}/snapshot-{persistenceid}".ToLower();
-            if (!_producers.ContainsKey(topic))
-            {
-                var producerConfig = new ProducerConfigBuilder<SnapshotEntry>()
+            var producerConfig = new ProducerConfigBuilder<SnapshotEntry>()
                    .ProducerName($"snapshot-{persistenceid}")
                    .Topic(topic)
                    .Schema(_snapshotEntrySchema)
                    .SendTimeout(10000);
-                var producer = await  _client.NewProducerAsync(_snapshotEntrySchema, producerConfig);
-                _producers[producer.Topic] = producer;
-            }
+            var producer = await _client.NewProducerAsync(_snapshotEntrySchema, producerConfig);
+            _producers[persistenceid] = producer;
+            return producer;
         }
         private async ValueTask<Producer<SnapshotEntry>> GetProducer(string persistenceid)
         {
-            var topic = $"persistent://{_settings.Tenant}/{_settings.Namespace}/snapshot-{persistenceid}".ToLower();
-            if (_producers.TryGetValue(topic, out var p))
+            var topic = $"persistent://{_settings.Tenant}/{_settings.Namespace}/snapshot".ToLower();
+            if (_producers.TryGetValue(persistenceid, out var producer))
             {
-                return p;
+                return producer;
             }
             else
             {
-                await CreateSnapshotProducer(persistenceid);
-                return _producers[topic];
+                return await CreateSnapshotProducer(topic, persistenceid);
             }
         }
         protected override void PostStop()

@@ -12,5 +12,7 @@ namespace Akka.Persistence.Pulsar.Journal
         public string Id { get; set; }
         public string PersistenceId { get; set; }
         public long SequenceNr { get; set; }
+        public long Ledger { get; set; }
+        public long EntryNr { get; set; }
     }
 }

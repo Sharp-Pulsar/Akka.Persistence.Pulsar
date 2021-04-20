@@ -15,12 +15,15 @@ using Akka.Streams.Dsl;
 
 namespace Akka.Persistence.Pulsar.Query
 {
-    public sealed class PulsarReadJournal : IPersistenceIdsQuery,
+    public sealed class PulsarReadJournal :
+        IPersistenceIdsQuery,
         ICurrentPersistenceIdsQuery,
         IEventsByPersistenceIdQuery,
         ICurrentEventsByPersistenceIdQuery,
         IEventsByTagQuery,
-        ICurrentEventsByTagQuery
+        ICurrentEventsByTagQuery,
+        IAllEventsQuery,
+        ICurrentAllEventsQuery
     {
         /// <summary>
         /// HOCON identifier

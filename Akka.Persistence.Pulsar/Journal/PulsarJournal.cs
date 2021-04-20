@@ -10,6 +10,7 @@
 #endregion
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -22,11 +23,21 @@ using Akka.Event;
 using Akka.Persistence.Journal;
 using Akka.Persistence.Pulsar.Query;
 using Akka.Serialization;
+using SharpPulsar;
+using SharpPulsar.Configuration;
+using SharpPulsar.Schemas;
+using SharpPulsar.User;
 
 namespace Akka.Persistence.Pulsar.Journal
 {
     public sealed class PulsarJournal : AsyncWriteJournal
     {
+        private readonly PulsarSystem _pulsarSystem;
+        private readonly PulsarClient _client; 
+        private readonly AvroSchema<JournalEntry> _journalEntrySchema;
+        private readonly PulsarSettings _settings;
+
+
         private readonly ILoggingAdapter _log = Context.GetLogger();
         private readonly Serializer _serializer;
         private static readonly Type PersistentRepresentationType = typeof(IPersistentRepresentation);
@@ -48,6 +59,8 @@ namespace Akka.Persistence.Pulsar.Journal
 
         private readonly PulsarJournalExecutor _journalExecutor;
         private readonly CancellationTokenSource _pendingRequestsCancellation;
+        public static readonly ConcurrentDictionary<string, Producer<JournalEntry>> _producers = new ConcurrentDictionary<string, Producer<JournalEntry>>();
+
 
         //public Akka.Serialization.Serialization Serialization => _serialization ??= Context.System.Serialization;
 
@@ -58,9 +71,14 @@ namespace Akka.Persistence.Pulsar.Journal
 
         public PulsarJournal(PulsarSettings settings)
         {
+            _settings = settings;
+            _journalEntrySchema = AvroSchema<JournalEntry>.Of(typeof(JournalEntry), new Dictionary<string, string>());
             _pendingRequestsCancellation = new CancellationTokenSource();
             _serializer = Context.System.Serialization.FindSerializerForType(PersistentRepresentationType);
-            _journalExecutor = new PulsarJournalExecutor(Context.System, settings, Context.GetLogger(), _serializer, _pendingRequestsCancellation);
+            _journalExecutor = new PulsarJournalExecutor(settings, Context.GetLogger(), _serializer);
+
+            _pulsarSystem = settings.CreateSystem(Context.System);
+            _client = _pulsarSystem.NewClient();
         }
 
         /// <summary>
@@ -104,9 +122,7 @@ namespace Akka.Persistence.Pulsar.Journal
         {
             var allTags = ImmutableHashSet<string>.Empty;
             var persistentIds = new HashSet<string>();
-            var messageList = messages.ToList();
-
-            var writeTasks = messageList.Select(async message =>
+            foreach(var message in messages)
             {
                 var persistentMessages = ((IImmutableList<IPersistentRepresentation>)message.Payload);
 
@@ -117,8 +133,7 @@ namespace Akka.Persistence.Pulsar.Journal
                         allTags = allTags.Union(t.Tags);
                     }
                 }
-
-                var sequenceId = message.HighestSequenceNr > 0 ? message.HighestSequenceNr: 1;
+                var sequenceId = message.HighestSequenceNr > 0 ? message.HighestSequenceNr : 1;
                 var metadata = new Dictionary<string, object>
                 {
                     ["sequenceId"] = sequenceId,
@@ -127,18 +142,32 @@ namespace Akka.Persistence.Pulsar.Journal
                         {"Tag", string.Join(",", allTags) }
                     }
                 };
-                var (topic, producer) = _journalExecutor.GetProducer(message.PersistenceId, "Journal");
-                var journalEntries = persistentMessages.Select(ToJournalEntry).Select(x => new Send(x, topic, metadata.ToImmutableDictionary())).ToList();
-                _journalExecutor.Client.BulkSend(new BulkSend(journalEntries, topic), producer);
+                var properties = new Dictionary<string, string>();
+                foreach(var tag in allTags)
+                {
+                    //HACKING: So that we can easily query for tags
+                    properties.TryAdd(tag.Trim().ToLower(), tag.Trim().ToLower());
+                }
+                var producer = await JournalProducer(message.PersistenceId); 
+                foreach(var m in persistentMessages)
+                {
+                    var journalEntry = ToJournalEntry(m);
+                    await producer.NewMessage()
+                        .Property("Tag", string.Join(",", allTags))
+                        .SequenceId(sequenceId)
+                        .Value(journalEntry)
+                        .SendAsync();
+                }
                 if (HasPersistenceIdSubscribers)
                     persistentIds.Add(message.PersistenceId);
-            });
 
-            var result = await Task<IImmutableList<Exception>>
+            }
+            
+            /*var result = await Task<IImmutableList<Exception>>
                 .Factory
                 .ContinueWhenAll(writeTasks.ToArray(),
                     tasks => tasks.Select(t => t.IsFaulted ? TryUnwrapException(t.Exception) : null).ToImmutableList());
-
+            */
             if (HasPersistenceIdSubscribers)
             {
                 foreach (var id in persistentIds)
@@ -155,7 +184,7 @@ namespace Akka.Persistence.Pulsar.Journal
                 }
             }
 
-            return result;
+            return await Task.FromResult(ImmutableList<Exception>.Empty);
         }
 
         protected override Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
@@ -191,7 +220,6 @@ namespace Akka.Persistence.Pulsar.Journal
 
             // stop all operations executed in the background
             _pendingRequestsCancellation.Cancel();
-            _journalExecutor.Client.Stop();
         }
         
         private byte[] Serialize(IPersistentRepresentation message)
@@ -208,7 +236,7 @@ namespace Akka.Persistence.Pulsar.Journal
             switch (message)
             {
                 case ReplayTaggedMessages replay:
-                    ReplayTaggedMessagesAsync(replay)
+                    ReplayTaggedMessagesAsync(replay).AsTask()
                         .PipeTo(replay.ReplyTo, success: h => new RecoverySuccess(h), failure: e => new ReplayMessagesFailure(e));
                     break;
                 case SubscribePersistenceId subscribe:
@@ -237,51 +265,19 @@ namespace Akka.Persistence.Pulsar.Journal
         /// </summary>
         /// <param name="replay">TBD</param>
         /// <returns>TBD</returns>
-        private async Task<long> ReplayTaggedMessagesAsync(ReplayTaggedMessages replay)
+        private async ValueTask<long> ReplayTaggedMessagesAsync(ReplayTaggedMessages replay)
         {
-            var topic = $"{_journalExecutor.Settings.TopicPrefix.TrimEnd('/')}/journal-*".ToLower();
-            var tag = replay.Tag;
-            if (!_taggedFirstRun)
-            {
-                var nextPlay = new NextPlay(topic, replay.Max, replay.FromOffset, replay.ToOffset, true);
-                foreach (var m in _journalExecutor.Client.EventSource<JournalEntry>(nextPlay))
-                {
-                    var ordering = m.SequenceNr;
-                    var payload = m.Payload;
-                    var persistent = Deserialize(payload);
-                    foreach (var adapted in AdaptFromJournal(persistent))
-                        replay.ReplyTo.Tell(new ReplayedTaggedMessage(adapted, tag, ordering),
-                            ActorRefs.NoSender);
-                }
-            }
-            else
-            {
-                var consumerListener = new DefaultConsumerEventListener(Console.WriteLine);
-                var readerListener = new DefaultMessageListener(null, null);
-                var jsonSchem = AvroSchema.Of(typeof(JournalEntry));
-                var readerConfig = new ReaderConfigBuilder()
-                    .ReaderName("event-reader")
-                    .Schema(jsonSchem)
-                    .EventListener(consumerListener)
-                    .ReaderListener(readerListener)
-                    .Topic(topic)
-                    .StartMessageId(MessageIdFields.Latest)
-                    .ReaderConfigurationData;
-                var repy = new ReplayTopic(readerConfig, _journalExecutor.Settings.AdminUrl, replay.FromOffset, replay.ToOffset,replay.Max, new Tag("Tag", tag), true);
-                foreach (var m in _journalExecutor.Client.EventSource<JournalEntry>(repy))
-                {
-                    var ordering = m.SequenceNr;
-                    var payload = m.Payload;
-                    var persistent = Deserialize(payload);
-                    foreach (var adapted in AdaptFromJournal(persistent))
-                        replay.ReplyTo.Tell(new ReplayedTaggedMessage(adapted, tag, ordering),
-                            ActorRefs.NoSender);
-                }
-            }
-
-            _taggedFirstRun = false;
-            var max = _journalExecutor.GetMaxOrderingId(replay);
-            return await Task.FromResult(max);
+           await foreach(var m in _journalExecutor.ReplayTagged(replay))
+           {
+                var ordering = m.SequenceNr;
+                var payload = m.Payload;
+                var persistent = Deserialize(payload);
+                foreach (var adapted in AdaptFromJournal(persistent))
+                    replay.ReplyTo.Tell(new ReplayedTaggedMessage(adapted, replay.Tag, ordering),
+                        ActorRefs.NoSender);
+           }
+            var max = await _journalExecutor.GetMaxOrdering(replay);
+            return max;
         }
 
         private void AddAllPersistenceIdSubscriber(IActorRef subscriber)
@@ -369,5 +365,21 @@ namespace Akka.Persistence.Pulsar.Journal
             }
         }
 
+        private async ValueTask<Producer<JournalEntry>> JournalProducer(string persistenceid)
+        {
+            var topic = $"persistent://{_settings.Tenant}/{_settings.Namespace}/journal".ToLower();
+            if (!_producers.TryGetValue(persistenceid, out var producer))
+            {
+                var producerConfig = new ProducerConfigBuilder<JournalEntry>()
+                    .ProducerName($"journal-{persistenceid}")
+                    .Topic(topic)
+                    .Schema(_journalEntrySchema)
+                    .SendTimeout(10000); 
+                producer = await _client.NewProducerAsync(_journalEntrySchema, producerConfig);
+                _producers[persistenceid] = producer;
+                return producer;
+            }
+            return producer;
+        }
     }
 }
