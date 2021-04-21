@@ -66,12 +66,80 @@ namespace Akka.Persistence.Pulsar.Journal
                 }
             }
         }
+        
+        public async ValueTask<long> SelectAllEvents(
+            long fromOffset,
+            long toOffset,
+            long max,
+            Action<ReplayedEvent> callback)
+        {
+            var maxOrdering = await SelectHighestSequenceNr();
+            var take = Math.Min(toOffset - fromOffset, max);
+            //RETENTION POLICY MUST BE SENT AT THE NAMESPACE ELSE TOPIC IS DELETED
+            var topic = $"journal".ToLower();
+            _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, IsDeleted, Payload, Ordering from {topic} WHERE Ordering > {fromOffset} ORDER BY  Ordering ASC LIMIT {take}";
+            _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
+
+            _sqlClientOptions.Execute = string.Empty;
+            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
+            {
+                switch (data.Response)
+                {
+                    case DataResponse dr:
+                        var journal = JsonSerializer.Deserialize<JournalEntry>(JsonSerializer.Serialize(dr.Data));                       
+                        var payload = journal.Payload;
+                        var persistent = Deserialize(payload);
+                        callback(new ReplayedEvent(persistent, journal.Ordering));
+                        break;
+                    case StatsResponse sr:
+                        if(_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                        break;
+                    case ErrorResponse er:
+                        _log.Error(er.Error.FailureInfo.Message);
+                        break;
+                    default:
+                        break; 
+                }
+            }
+            return maxOrdering;
+        }
         public async ValueTask<long> ReadHighestSequenceNr(string persistenceId, long fromSequenceNr)
         {
             try
             {
                 var topic = $"journal";
                 _sqlClientOptions.Execute = $"select SequenceNr as Id from {topic} WHERE PersistenceId = {persistenceId}  ORDER BY __sequence_id__ as DESC LIMIT 1";
+                _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
+                var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
+                _sqlClientOptions.Execute = string.Empty;
+                var data = response.Response;
+                switch (data)
+                {
+                    case DataResponse dr:
+                        return (long)dr.Data["Id"];
+                    case StatsResponse sr:
+                        if(_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                        return 0;
+                    case ErrorResponse er:
+                        _log.Error(er.Error.FailureInfo.Message);
+                        return -1;
+                    default:
+                        return 0;
+                }
+            }
+            catch (Exception e)
+            {
+                return 0;
+            }
+        }
+        public async ValueTask<long> SelectHighestSequenceNr()
+        {
+            try
+            {
+                var topic = $"journal";
+                _sqlClientOptions.Execute = $"select MAX(Ordering) as Id from {topic}";
                 _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
                 var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
                 _sqlClientOptions.Execute = string.Empty;
@@ -126,6 +194,33 @@ namespace Akka.Persistence.Pulsar.Journal
                         break;
                 }
             }
+        }
+        public async ValueTask<IEnumerable<string>> SelectAllPersistenceIds(long offset)
+        {
+            var topic = $"journal".ToLower();
+            _sqlClientOptions.Execute = $"select DISTINCT(PersistenceId) AS PersistenceId from {topic} WHERE Ordering > {offset}";
+            _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
+            var ids = new List<string>();
+            _sqlClientOptions.Execute = string.Empty;
+            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
+            {
+                switch (data.Response)
+                {
+                    case DataResponse dr:
+                        ids.Add(dr.Data["PersistenceId"].ToString());
+                        break;
+                    case StatsResponse sr:
+                        if (_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                        break;
+                    case ErrorResponse er:
+                        _log.Error(er.Error.FailureInfo.Message);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return ids;
         }
         internal async ValueTask<long> GetMaxOrdering(ReplayTaggedMessages replay)
         {

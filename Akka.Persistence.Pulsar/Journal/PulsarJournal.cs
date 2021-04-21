@@ -30,7 +30,7 @@ using SharpPulsar.User;
 
 namespace Akka.Persistence.Pulsar.Journal
 {
-    public sealed class PulsarJournal : AsyncWriteJournal
+    public class PulsarJournal : AsyncWriteJournal
     {
         private readonly PulsarSystem _pulsarSystem;
         private readonly PulsarClient _client; 
@@ -42,20 +42,11 @@ namespace Akka.Persistence.Pulsar.Journal
         private readonly Serializer _serializer;
         private static readonly Type PersistentRepresentationType = typeof(IPersistentRepresentation);
 
-        private readonly HashSet<string> _allPersistenceIds = new HashSet<string>();
-        private readonly HashSet<string> _registeredPersistenceIds = new HashSet<string>();
-        private readonly HashSet<IActorRef> _allPersistenceIdSubscribers = new HashSet<IActorRef>();
-        private readonly Dictionary<string, ISet<IActorRef>> _tagSubscribers =
-            new Dictionary<string, ISet<IActorRef>>();
-        private readonly Dictionary<string, ISet<IActorRef>> _persistenceIdSubscribers
-            = new Dictionary<string, ISet<IActorRef>>();
+        private ImmutableDictionary<string, IImmutableSet<IActorRef>> _persistenceIdSubscribers = ImmutableDictionary.Create<string, IImmutableSet<IActorRef>>();
+        private ImmutableDictionary<string, IImmutableSet<IActorRef>> _tagSubscribers = ImmutableDictionary.Create<string, IImmutableSet<IActorRef>>();
+        private readonly HashSet<IActorRef> _newEventsSubscriber = new HashSet<IActorRef>();
+        private IImmutableDictionary<string, long> _tagSequenceNr = ImmutableDictionary<string, long>.Empty;
 
-        private bool _taggedFirstRun = true;
-
-        /// <summary>
-        /// TBD
-        /// </summary>
-        public IEnumerable<string> AllPersistenceIds => _allPersistenceIds;
 
         private readonly PulsarJournalExecutor _journalExecutor;
         private readonly CancellationTokenSource _pendingRequestsCancellation;
@@ -95,8 +86,6 @@ namespace Akka.Persistence.Pulsar.Journal
         //Is ReplayMessagesAsync called once per actor lifetime?
         public override async Task ReplayMessagesAsync(IActorContext context, string persistenceId, long fromSequenceNr, long toSequenceNr, long max, Action<IPersistentRepresentation> recoveryCallback)
         {
-            
-            NotifyNewPersistenceIdAdded(persistenceId);
             await _journalExecutor.ReplayMessages(persistenceId, fromSequenceNr, toSequenceNr, max,
                 recoveryCallback);
         }
@@ -108,7 +97,6 @@ namespace Akka.Persistence.Pulsar.Journal
         /// </summary>
         public override async Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr)
         {
-            NotifyNewPersistenceIdAdded(persistenceId);
             return await _journalExecutor.ReadHighestSequenceNr(persistenceId, fromSequenceNr);
         }
         /// <summary>
@@ -150,8 +138,6 @@ namespace Akka.Persistence.Pulsar.Journal
                         .Value(journalEntry)
                         .SendAsync();
                 }
-                if (HasPersistenceIdSubscribers)
-                    persistentIds.Add(message.PersistenceId);
 
             }
             
@@ -160,13 +146,6 @@ namespace Akka.Persistence.Pulsar.Journal
                 .ContinueWhenAll(writeTasks.ToArray(),
                     tasks => tasks.Select(t => t.IsFaulted ? TryUnwrapException(t.Exception) : null).ToImmutableList());
             */
-            if (HasPersistenceIdSubscribers)
-            {
-                foreach (var id in persistentIds)
-                {
-                    NotifyPersistenceIdChange(id);
-                }
-            }
 
             if (HasTagSubscribers && allTags.Count != 0)
             {
@@ -206,6 +185,7 @@ namespace Akka.Persistence.Pulsar.Journal
                 Tags = JsonSerializer.Serialize(tagged.Tags == null ? new List<string>() : tagged.Tags.ToList(), new JsonSerializerOptions{WriteIndented = true} )
             };
         }
+        protected bool HasTagSubscribers => _tagSubscribers.Count != 0;
         protected override void PostStop()
         {
             base.PostStop();
@@ -228,29 +208,43 @@ namespace Akka.Persistence.Pulsar.Journal
             switch (message)
             {
                 case ReplayTaggedMessages replay:
-                    ReplayTaggedMessagesAsync(replay).AsTask()
+                    ReplayTaggedMessagesAsync(replay)
+                        .AsTask()
                         .PipeTo(replay.ReplyTo, success: h => new RecoverySuccess(h), failure: e => new ReplayMessagesFailure(e));
-                    break;
+                    return true;
+                case ReplayAllEvents replay:
+                    ReplayAllEventsAsync(replay)
+                        .PipeTo(replay.ReplyTo, success: h => new EventReplaySuccess(h),
+                            failure: e => new EventReplayFailure(e));
+                    return true;
                 case SubscribePersistenceId subscribe:
                     AddPersistenceIdSubscriber(Sender, subscribe.PersistenceId);
                     Context.Watch(Sender);
-                    break;
-                case SubscribeAllPersistenceIds subscribe:
-                    AddAllPersistenceIdSubscriber(Sender);
-                    Context.Watch(Sender);
-                    break;
+                    return true;
+                case SelectCurrentPersistenceIds request:
+                    SelectAllPersistenceIdsAsync(request.Offset)
+                        .AsTask()
+                        .PipeTo(request.ReplyTo, success: result => new CurrentPersistenceIds(result.Ids, request.Offset));
+                    return true;
                 case SubscribeTag subscribe:
                     AddTagSubscriber(Sender, subscribe.Tag);
                     Context.Watch(Sender);
-                    break;
+                    return true;
+                case SubscribeNewEvents _:
+                    AddNewEventsSubscriber(Sender);
+                    Context.Watch(Sender);
+                    return true;
                 case Terminated terminated:
                     RemoveSubscriber(terminated.ActorRef);
-                    break;
+                    return true;
                 default:
                     return false;
             }
+        }
 
-            return true;
+        public void AddNewEventsSubscriber(IActorRef subscriber)
+        {
+            _newEventsSubscriber.Add(subscriber);
         }
         /// <summary>
         /// Replays all events with given tag withing provided boundaries from current database.
@@ -272,70 +266,68 @@ namespace Akka.Persistence.Pulsar.Journal
             return max;
         }
 
-        private void AddAllPersistenceIdSubscriber(IActorRef subscriber)
-        {
-            _allPersistenceIdSubscribers.Add(subscriber);
-            subscriber.Tell(new CurrentPersistenceIds(AllPersistenceIds));
-        }
 
-        private void AddTagSubscriber(IActorRef subscriber, string tag)
+        /// <summary>
+        /// TBD
+        /// </summary>
+        /// <param name="subscriber">TBD</param>
+        /// <param name="tag">TBD</param>
+        public void AddTagSubscriber(IActorRef subscriber, string tag)
         {
             if (!_tagSubscribers.TryGetValue(tag, out var subscriptions))
             {
-                subscriptions = new HashSet<IActorRef>();
-                _tagSubscribers.Add(tag, subscriptions);
+                _tagSubscribers = _tagSubscribers.Add(tag, ImmutableHashSet.Create(subscriber));
             }
-
-            subscriptions.Add(subscriber);
+            else
+            {
+                _tagSubscribers = _tagSubscribers.SetItem(tag, subscriptions.Add(subscriber));
+            }
         }
-
-        private void AddPersistenceIdSubscriber(IActorRef subscriber, string persistenceId)
+        protected virtual async Task<long> ReplayAllEventsAsync(ReplayAllEvents replay)
+        {
+            return await _journalExecutor
+                        .SelectAllEvents(
+                            replay.FromOffset,
+                            replay.ToOffset,
+                            replay.Max,
+                            replayedEvent => {
+                                foreach (var adapted in AdaptFromJournal(replayedEvent.Persistent))
+                                {
+                                    replay.ReplyTo.Tell(new ReplayedEvent(adapted, replayedEvent.Offset), ActorRefs.NoSender);
+                                }
+                            });
+        }
+        public void AddPersistenceIdSubscriber(IActorRef subscriber, string persistenceId)
         {
             if (!_persistenceIdSubscribers.TryGetValue(persistenceId, out var subscriptions))
             {
-                subscriptions = new HashSet<IActorRef>();
-                _persistenceIdSubscribers.Add(persistenceId, subscriptions);
+                _persistenceIdSubscribers = _persistenceIdSubscribers.Add(persistenceId, ImmutableHashSet.Create(subscriber));
             }
-
-            subscriptions.Add(subscriber);
+            else
+            {
+                _persistenceIdSubscribers = _persistenceIdSubscribers.SetItem(persistenceId, subscriptions.Add(subscriber));
+            }
         }
 
         private void RemoveSubscriber(IActorRef subscriber)
         {
-            var pidSubscriptions = _persistenceIdSubscribers.Values.Where(x => x.Contains(subscriber));
-            foreach (var subscription in pidSubscriptions)
-                subscription.Remove(subscriber);
+            _persistenceIdSubscribers = _persistenceIdSubscribers.SetItems(_persistenceIdSubscribers
+                .Where(kv => kv.Value.Contains(subscriber))
+                .Select(kv => new KeyValuePair<string, IImmutableSet<IActorRef>>(kv.Key, kv.Value.Remove(subscriber))));
 
-            var tagSubscriptions = _tagSubscribers.Values.Where(x => x.Contains(subscriber));
-            foreach (var subscription in tagSubscriptions)
-                subscription.Remove(subscriber);
+            _tagSubscribers = _tagSubscribers.SetItems(_tagSubscribers
+                .Where(kv => kv.Value.Contains(subscriber))
+                .Select(kv => new KeyValuePair<string, IImmutableSet<IActorRef>>(kv.Key, kv.Value.Remove(subscriber))));
 
-            _allPersistenceIdSubscribers.Remove(subscriber);
+            _newEventsSubscriber.Remove(subscriber);
         }
-
-        protected bool HasAllPersistenceIdSubscribers => _allPersistenceIdSubscribers.Count != 0;
-        protected bool HasTagSubscribers => _tagSubscribers.Count != 0;
-        protected bool HasPersistenceIdSubscribers => _persistenceIdSubscribers.Count != 0;
-
-        private void NotifyNewPersistenceIdAdded(string persistenceId)
+        private async ValueTask<(IEnumerable<string> Ids, long LastOrdering)> SelectAllPersistenceIdsAsync(long offset)
         {
-            var isNew = TryAddPersistenceId(persistenceId);
-            
-            if (isNew && HasAllPersistenceIdSubscribers)
-            {
-                var added = new PersistenceIdAdded(persistenceId);
-                foreach (var subscriber in _allPersistenceIdSubscribers)
-                    subscriber.Tell(added);
-            }
+            var lastOrdering = await _journalExecutor.SelectHighestSequenceNr();
+            var ids = await _journalExecutor.SelectAllPersistenceIds(offset);
+            return (ids, lastOrdering);
         }
 
-        private bool TryAddPersistenceId(string persistenceId)
-        {
-            lock (_allPersistenceIds)
-            {
-                return _allPersistenceIds.Add(persistenceId);
-            }
-        }
 
         private void NotifyPersistenceIdChange(string persistenceId)
         {
