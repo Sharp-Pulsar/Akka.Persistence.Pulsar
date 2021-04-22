@@ -62,13 +62,14 @@ namespace Akka.Persistence.Pulsar.Journal
 
         public PulsarJournal(PulsarSettings settings)
         {
+            var actorSystem = Context.System;
             _settings = settings;
             _journalEntrySchema = AvroSchema<JournalEntry>.Of(typeof(JournalEntry), new Dictionary<string, string>());
             _pendingRequestsCancellation = new CancellationTokenSource();
             _serializer = Context.System.Serialization.FindSerializerForType(PersistentRepresentationType);
-            _journalExecutor = new PulsarJournalExecutor(settings, Context.GetLogger(), _serializer);
+            _journalExecutor = new PulsarJournalExecutor(actorSystem, settings, Context.GetLogger(), _serializer);
 
-            _pulsarSystem = settings.CreateSystem(Context.System);
+            _pulsarSystem = settings.CreateSystem(actorSystem);
             _client = _pulsarSystem.NewClient();
         }
 
@@ -109,7 +110,7 @@ namespace Akka.Persistence.Pulsar.Journal
         protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
         {
             var allTags = ImmutableHashSet<string>.Empty;
-            var persistentIds = new HashSet<string>();
+            var exceptions = new List<Exception>();
             foreach(var message in messages)
             {
                 var persistentMessages = ((IImmutableList<IPersistentRepresentation>)message.Payload);
@@ -139,6 +140,7 @@ namespace Akka.Persistence.Pulsar.Journal
                         .SendAsync();
                 }
 
+                exceptions.Add(null);
             }
             
             /*var result = await Task<IImmutableList<Exception>>
@@ -155,7 +157,7 @@ namespace Akka.Persistence.Pulsar.Journal
                 }
             }
 
-            return await Task.FromResult(ImmutableList<Exception>.Empty);
+            return exceptions.ToImmutableList();
         }
 
         protected override Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
@@ -326,17 +328,6 @@ namespace Akka.Persistence.Pulsar.Journal
             var lastOrdering = await _journalExecutor.SelectHighestSequenceNr();
             var ids = await _journalExecutor.SelectAllPersistenceIds(offset);
             return (ids, lastOrdering);
-        }
-
-
-        private void NotifyPersistenceIdChange(string persistenceId)
-        {
-            if (_persistenceIdSubscribers.TryGetValue(persistenceId, out var subscribers))
-            {
-                var changed = new EventAppended(persistenceId);
-                foreach (var subscriber in subscribers)
-                    subscriber.Tell(changed);
-            }
         }
 
         private void NotifyTagChange(string tag)

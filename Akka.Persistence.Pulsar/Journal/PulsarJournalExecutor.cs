@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Akka.Actor;
 using Akka.Event;
 using Akka.Persistence.Pulsar.Query;
 using Akka.Serialization;
@@ -22,25 +23,24 @@ namespace Akka.Persistence.Pulsar.Journal
         private readonly Serializer _serializer;
         private static readonly Type PersistentRepresentationType = typeof(IPersistentRepresentation);
 
-        private readonly List<string> _activeReplayTopics;
-        public PulsarJournalExecutor(PulsarSettings settings, ILoggingAdapter log, Serializer serializer)
+        public PulsarJournalExecutor(ActorSystem actorSystem, PulsarSettings settings, ILoggingAdapter log, Serializer serializer)
         {
-            _activeReplayTopics = new List<string>();
             _log = log;
             _serializer = serializer; 
             _sqlClientOptions = new ClientOptions
             {
-                Server = settings.ServiceUrl,
+                Server = settings.PrestoServer,
                 Catalog = "pulsar",
                 Schema = $"{settings.Tenant}/{settings.Namespace}"
             };
-            _sql = PulsarSystem.NewSql();
+            _sql = PulsarSystem.NewSql(actorSystem);
         }
         public async ValueTask ReplayMessages(string persistenceId, long fromSequenceNr, long toSequenceNr, long max, Action<IPersistentRepresentation> recoveryCallback)
         {
             //RETENTION POLICY MUST BE SENT AT THE NAMESPACE ELSE TOPIC IS DELETED
             var topic = $"journal".ToLower();
-            _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, IsDeleted, Payload, Ordering, Tags from {topic} WHERE PersistenceId = {persistenceId} AND SequenceNr BETWEEN {fromSequenceNr} AND {toSequenceNr} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT {max}";
+            var take = Math.Min(toSequenceNr - fromSequenceNr, max);
+            _sqlClientOptions.Execute = $"select Id, PersistenceId, __sequence_id__ as SequenceNr, IsDeleted, Payload, Ordering, Tags from {topic} WHERE PersistenceId = '{persistenceId}' AND __sequence_id__ BETWEEN {fromSequenceNr} AND {toSequenceNr} ORDER BY __sequence_id__ ASC LIMIT {take}";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
 
             _sqlClientOptions.Execute = string.Empty;
@@ -59,7 +59,7 @@ namespace Akka.Persistence.Pulsar.Journal
                             _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
                         break;
                     case ErrorResponse er:
-                        _log.Error(er.Error.FailureInfo.Message);
+                        _log.Error(er?.Error.FailureInfo.Message);
                         break;
                     default:
                         break; 
@@ -109,7 +109,7 @@ namespace Akka.Persistence.Pulsar.Journal
             try
             {
                 var topic = $"journal";
-                _sqlClientOptions.Execute = $"select SequenceNr as Id from {topic} WHERE PersistenceId = {persistenceId}  ORDER BY __sequence_id__ as DESC LIMIT 1";
+                _sqlClientOptions.Execute = $"select __sequence_id__ as Id from {topic} WHERE PersistenceId = '{persistenceId}'  ORDER BY __sequence_id__ DESC LIMIT 1";
                 _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
                 var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
                 _sqlClientOptions.Execute = string.Empty;
@@ -117,7 +117,8 @@ namespace Akka.Persistence.Pulsar.Journal
                 switch (data)
                 {
                     case DataResponse dr:
-                        return (long)dr.Data["Id"];
+                        var id = dr.Data["Id"].ToString();
+                        return long.Parse(id);
                     case StatsResponse sr:
                         if(_log.IsDebugEnabled)
                             _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
@@ -171,7 +172,8 @@ namespace Akka.Persistence.Pulsar.Journal
         public async IAsyncEnumerable<JournalEntry> ReplayTagged(ReplayTaggedMessages replay)
         {
             var topic = $"journal".ToLower();
-            _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, IsDeleted, Payload, Ordering, Tags from {topic} WHERE SequenceNr BETWEEN {replay.FromOffset} AND {replay.ToOffset} AND element_at(cast(json_parse(__properties__) as map(varchar, varchar)), '{replay.Tag.Trim().ToLower()}') = '{replay.Tag.Trim().ToLower()}' ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT {replay.Max}";
+            var take = Math.Min(replay.ToOffset - replay.FromOffset, replay.Max);
+            _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, IsDeleted, Payload, Ordering, Tags from {topic} WHERE SequenceNr BETWEEN {replay.FromOffset} AND {replay.ToOffset} AND element_at(cast(json_parse(__properties__) as map(varchar, varchar)), '{replay.Tag.Trim().ToLower()}') = '{replay.Tag.Trim().ToLower()}' ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT {take}";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
 
             _sqlClientOptions.Execute = string.Empty;
