@@ -29,7 +29,7 @@ namespace Akka.Persistence.Pulsar.Tests
     {
         private static readonly Config SpecConfig = ConfigurationFactory.ParseString(@"
             akka.persistence.journal.plugin = ""akka.persistence.journal.pulsar""
-            akka.test.single-expect-default = 60s
+            akka.test.single-expect-default = 180s
         ").WithFallback(PulsarPersistence.DefaultConfiguration());
         public PlusarJournalSpec(ITestOutputHelper output) : base(FromConfig(SpecConfig).WithFallback(Config), "JournalSpec", output)
         {
@@ -71,7 +71,7 @@ namespace Akka.Persistence.Pulsar.Tests
         /// </summary>
         protected IEnumerable<AtomicWrite> Initialize()
         {
-            _timeout = 60000;
+            _timeout = 180000;
             _pid = Guid.NewGuid().ToString();
             _senderProbe = CreateTestProbe();
             _receiverProbe = new Prober(Sys);

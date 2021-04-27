@@ -12,9 +12,9 @@
     <ItemGroup>
       <PackageReference Include="Akka.Persistence.Query" Version="1.4.18" />
       <PackageReference Include="avroschemagenerator" Version="1.9.0" />
-      <PackageReference Include="sharppulsar" Version="2.0.0-beta.8" />
+      <PackageReference Include="sharppulsar" Version="2.0.0-beta.9" />
       <PackageReference Include="System.Linq.Async" Version="5.0.0" />
-      <PackageReference Include="System.Text.Json" Version="5.0.2" />
+      <PackageReference Include="System.Text.Json" Version="6.0.0-preview.3.21201.4" />
     </ItemGroup>
 
     <ItemGroup>

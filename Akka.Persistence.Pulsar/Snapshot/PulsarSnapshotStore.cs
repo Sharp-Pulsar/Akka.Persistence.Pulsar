@@ -80,8 +80,7 @@ namespace Akka.Persistence.Pulsar.Snapshot
             SelectedSnapshot shot = null;
             _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, Timestamp, Snapshot from snapshot WHERE PersistenceId = {persistenceId} AND SequenceNr <= {criteria.MaxSequenceNr} AND Timestamp <= {criteria.MaxTimeStamp.ToEpochTime()} ORDER BY SequenceNr DESC, __publish_time__ DESC LIMIT 1";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
-            var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
-            _sqlClientOptions.Execute = string.Empty;
+            var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
             var data = response.Response;
             switch (data)
             {
@@ -91,7 +90,8 @@ namespace Akka.Persistence.Pulsar.Snapshot
                     _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
                     return shot;
                 case ErrorResponse er:
-                    throw new Exception(er.Error.FailureInfo.Message);
+                    _log.Error(er.Error.FailureInfo.Message);
+                    return shot;
                 default:
                     return shot;
             }

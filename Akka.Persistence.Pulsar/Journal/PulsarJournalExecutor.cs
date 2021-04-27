@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Akka.Actor;
@@ -39,34 +40,42 @@ namespace Akka.Persistence.Pulsar.Journal
         {
             //RETENTION POLICY MUST BE SENT AT THE NAMESPACE ELSE TOPIC IS DELETED
             var topic = $"journal".ToLower();
+            if (fromSequenceNr > 0)
+                fromSequenceNr = fromSequenceNr - 1;
+
             var take = Math.Min(toSequenceNr - fromSequenceNr, max);
             _sqlClientOptions.Execute = $"select Id, PersistenceId, __sequence_id__ as SequenceNr, IsDeleted, Payload, Ordering, Tags from {topic} WHERE PersistenceId = '{persistenceId}' AND __sequence_id__ BETWEEN {fromSequenceNr} AND {toSequenceNr} ORDER BY __sequence_id__ ASC LIMIT {take}";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
 
-            _sqlClientOptions.Execute = string.Empty;
-            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
+            var data = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
+            switch (data.Response)
             {
-                switch (data.Response)
-                {
-                    case DataResponse dr:
-                        var journal = JsonSerializer.Deserialize<JournalEntry>(JsonSerializer.Serialize(dr.Data));                       
-                        var payload = journal.Payload;
-                        var der = Deserialize(payload);
-                        recoveryCallback(der);
-                        break;
-                    case StatsResponse sr:
-                        if(_log.IsDebugEnabled)
-                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
-                        break;
-                    case ErrorResponse er:
-                        _log.Error(er?.Error.FailureInfo.Message);
-                        break;
-                    default:
-                        break; 
-                }
+                case DataResponse dr:
+                    {
+                        var records = dr.Data;
+                        for (var i = 0; i < records.Count; i++)
+                        {
+                            var journal = JsonSerializer.Deserialize<JournalEntry>(JsonSerializer.Serialize(records[i]));
+                            var payload = journal.Payload;
+                            var der = Deserialize(payload);
+                            recoveryCallback(der);
+                        }
+                        if (_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(dr.StatementStats, new JsonSerializerOptions { WriteIndented = true }));
+                    }
+                    break;
+                case StatsResponse sr:
+                    if (_log.IsDebugEnabled)
+                        _log.Info(JsonSerializer.Serialize(sr.Stats, new JsonSerializerOptions { WriteIndented = true }));
+                    break;
+                case ErrorResponse er:
+                    _log.Error(er?.Error.FailureInfo.Message);
+                    break;
+                default:
+                    break;
             }
         }
-        
+
         public async ValueTask<long> SelectAllEvents(
             long fromOffset,
             long toOffset,
@@ -80,27 +89,34 @@ namespace Akka.Persistence.Pulsar.Journal
             _sqlClientOptions.Execute = $"select Id, PersistenceId, SequenceNr, IsDeleted, Payload, Ordering from {topic} WHERE Ordering > {fromOffset} ORDER BY  Ordering ASC LIMIT {take}";
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
 
-            _sqlClientOptions.Execute = string.Empty;
-            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
+            var data = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
+            switch (data.Response)
             {
-                switch (data.Response)
-                {
-                    case DataResponse dr:
-                        var journal = JsonSerializer.Deserialize<JournalEntry>(JsonSerializer.Serialize(dr.Data));                       
-                        var payload = journal.Payload;
-                        var persistent = Deserialize(payload);
-                        callback(new ReplayedEvent(persistent, journal.Ordering));
-                        break;
-                    case StatsResponse sr:
-                        if(_log.IsDebugEnabled)
-                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
-                        break;
-                    case ErrorResponse er:
-                        _log.Error(er.Error.FailureInfo.Message);
-                        break;
-                    default:
-                        break; 
-                }
+                case DataResponse dr:
+                    {
+                        var records = dr.Data;
+                        for (var i = 0; i < records.Count; i++)
+                        {
+
+                            var journal = JsonSerializer.Deserialize<JournalEntry>(JsonSerializer.Serialize(records[i]));
+                            var payload = journal.Payload;
+                            var persistent = Deserialize(payload);
+                            callback(new ReplayedEvent(persistent, journal.Ordering));
+                        }
+                        if (_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(dr.StatementStats, new JsonSerializerOptions { WriteIndented = true }));
+
+                    }
+                    break;
+                case StatsResponse sr:
+                    if (_log.IsDebugEnabled)
+                        _log.Info(JsonSerializer.Serialize(sr.Stats, new JsonSerializerOptions { WriteIndented = true }));
+                    break;
+                case ErrorResponse er:
+                    _log.Error(er.Error.FailureInfo.Message);
+                    break;
+                default:
+                    break;
             }
             return maxOrdering;
         }
@@ -111,17 +127,25 @@ namespace Akka.Persistence.Pulsar.Journal
                 var topic = $"journal";
                 _sqlClientOptions.Execute = $"select __sequence_id__ as Id from {topic} WHERE PersistenceId = '{persistenceId}'  ORDER BY __sequence_id__ DESC LIMIT 1";
                 _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
-                var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
-                _sqlClientOptions.Execute = string.Empty;
+                var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
+                
                 var data = response.Response;
                 switch (data)
                 {
                     case DataResponse dr:
-                        var id = dr.Data["Id"].ToString();
-                        return long.Parse(id);
+                        {
+                            var id = 0L;
+                            if(dr.Data.Count > 0)
+                            {
+                                id = long.Parse(dr.Data.First()["Id"].ToString());
+                            }
+                            if (_log.IsDebugEnabled)
+                                _log.Info(JsonSerializer.Serialize(dr.StatementStats, new JsonSerializerOptions { WriteIndented = true }));
+                            return id;
+                        }
                     case StatsResponse sr:
                         if(_log.IsDebugEnabled)
-                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                            _log.Info(JsonSerializer.Serialize(sr.Stats, new JsonSerializerOptions { WriteIndented = true }));
                         return 0;
                     case ErrorResponse er:
                         _log.Error(er.Error.FailureInfo.Message);
@@ -142,16 +166,25 @@ namespace Akka.Persistence.Pulsar.Journal
                 var topic = $"journal";
                 _sqlClientOptions.Execute = $"select MAX(Ordering) as Id from {topic}";
                 _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
-                var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
-                _sqlClientOptions.Execute = string.Empty;
+                var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
+                
                 var data = response.Response;
                 switch (data)
                 {
                     case DataResponse dr:
-                        return (long)dr.Data["Id"];
+                        {
+                            var id = 0L;
+                            if (dr.Data.Count > 0)
+                            {
+                                id = long.Parse(dr.Data.First()["Id"].ToString());
+                            }
+                            if (_log.IsDebugEnabled)
+                                _log.Info(JsonSerializer.Serialize(dr.StatementStats, new JsonSerializerOptions { WriteIndented = true }));
+                            return id;
+                        }
                     case StatsResponse sr:
                         if(_log.IsDebugEnabled)
-                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
+                            _log.Info(JsonSerializer.Serialize(sr.Stats, new JsonSerializerOptions { WriteIndented = true }));
                         return 0;
                     case ErrorResponse er:
                         _log.Error(er.Error.FailureInfo.Message);
@@ -177,7 +210,7 @@ namespace Akka.Persistence.Pulsar.Journal
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
 
             _sqlClientOptions.Execute = string.Empty;
-            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
+            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(5)))
             {
                 switch (data.Response)
                 {
@@ -204,23 +237,21 @@ namespace Akka.Persistence.Pulsar.Journal
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
             var ids = new List<string>();
             _sqlClientOptions.Execute = string.Empty;
-            await foreach (var data in _sql.ReadResults(TimeSpan.FromSeconds(30)))
+            var data = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
+            switch (data.Response)
             {
-                switch (data.Response)
-                {
-                    case DataResponse dr:
-                        ids.Add(dr.Data["PersistenceId"].ToString());
-                        break;
-                    case StatsResponse sr:
-                        if (_log.IsDebugEnabled)
-                            _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));
-                        break;
-                    case ErrorResponse er:
-                        _log.Error(er.Error.FailureInfo.Message);
-                        break;
-                    default:
-                        break;
-                }
+                case DataResponse dr:
+                    ids.AddRange(dr.Data.Select(x => x["PersistenceId"].ToString()));
+                    break;
+                case StatsResponse sr:
+                    if (_log.IsDebugEnabled)
+                        _log.Info(JsonSerializer.Serialize(sr.Stats, new JsonSerializerOptions { WriteIndented = true }));
+                    break;
+                case ErrorResponse er:
+                    _log.Error(er.Error.FailureInfo.Message);
+                    break;
+                default:
+                    break;
             }
             return ids;
         }
@@ -231,13 +262,23 @@ namespace Akka.Persistence.Pulsar.Journal
             _sql.SendQuery(new SqlQuery(_sqlClientOptions, e => { _log.Error(e.ToString()); }, l => { _log.Info(l); }));
 
             _sqlClientOptions.Execute = string.Empty;
-            var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(30));
+            var response = await _sql.ReadQueryResultAsync(TimeSpan.FromSeconds(5));
             var max = 0L;
             var data = response.Response;
             switch (data)
             {
                 case DataResponse dr:
-                    max = (long)dr.Data["Ordering"];
+                    {
+                        var id = 0L;
+                        if (dr.Data.Count > 0)
+                        {
+                            id = long.Parse(dr.Data.First()["Ordering"].ToString());
+                        }
+                        if (_log.IsDebugEnabled)
+                            _log.Info(JsonSerializer.Serialize(dr.StatementStats, new JsonSerializerOptions { WriteIndented = true }));
+                        
+                        return max = id;
+                    }
                     break;
                 case StatsResponse sr:
                     _log.Info(JsonSerializer.Serialize(sr, new JsonSerializerOptions { WriteIndented = true }));

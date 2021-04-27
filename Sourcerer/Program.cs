@@ -22,12 +22,12 @@ namespace Sourcerer
             var actorSystem = ActorSystem.Create("SampleSystem", ConfigurationFactory.ParseString(config));
             _mat = ActorMaterializer.Create(actorSystem);
             _readJournal = PersistenceQuery.Get(actorSystem).ReadJournalFor<PulsarReadJournal>("akka.persistence.query.journal.pulsar");
-            //PersistenceIds();
+            PersistenceIds();
             //CurrentPersistenceIds();
             //EventsByPersistenceId();
-            //CurrentEventsByPersistenceId();
+            CurrentEventsByPersistenceId();
             //EventsByTag();
-            CurrentEventsByTag();
+            //CurrentEventsByTag();
 
             Console.ReadLine();
         }
@@ -56,7 +56,7 @@ namespace Sourcerer
         }
         private static void CurrentEventsByPersistenceId()
         {
-            var persistenceIdsSource1 = _readJournal.CurrentEventsByPersistenceId("utcreader-1", 1L, 320);
+            var persistenceIdsSource1 = _readJournal.CurrentEventsByPersistenceId("utcreader-2", 1L, 320);
             var persistenceStream1 = new SourceObservable<EventEnvelope>(persistenceIdsSource1, _mat);
             persistenceStream1.Subscribe(e =>
             {
@@ -66,7 +66,7 @@ namespace Sourcerer
 
         private static void EventsByPersistenceId()
         {
-            var persistenceSource = _readJournal.EventsByPersistenceId("utcreader-1", 1L, long.MaxValue);
+            var persistenceSource = _readJournal.EventsByPersistenceId("utcreader-2", 1L, long.MaxValue);
             _persistenceStream = new SourceObservable<EventEnvelope>(persistenceSource, _mat);
             _persistenceStream.Subscribe(e =>
             {
